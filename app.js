@@ -41,7 +41,8 @@ worker.onmessage = (e) => {
 
 async function init() {
   await post('INIT', {
-    //  ⛔ do NOT pass adapters here — they can't be cloned to the worker
+    // pass API base as a plain string so worker can use it (workers don't have window)
+    apiBase: (window.VisionConfig && window.VisionConfig.API_BASE) || "",
     cache: window.RiskCache,
     network: getNetwork(),
     ruleset: 'safesend-2025.10.1',
