@@ -1,6 +1,6 @@
 import { graph } from './graph.js';
 
-const worker = new Worker('../workers/visionRisk.worker.js', { type:'module' });
+const worker = new Worker('./workers/visionRisk.worker.js', { type:'module' });
 
 const pending = new Map();
 function post(type, payload, onChunk){
