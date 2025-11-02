@@ -135,22 +135,25 @@ const scorePanel = (window.ScoreMeter && window.ScoreMeter('#scorePanel')) || {
 };
 
 function updateScorePanel(res) {
-  // Provide a parity badge text; you can flip to boolean later if you want to hide it sometimes.
+  // Show badge text; keep visible unless explicitly turned off
   res.parity = (typeof res.parity === 'string' || res.parity === true) ? res.parity : 'SafeSend parity';
 
-  // If your worker later returns a structured breakdown, attach it as res.breakdown = [...]
-  // For now, the ScoreMeter will derive weights from reasons.
+  // Optional: attach structured breakdown if/when your worker returns it
+  // res.breakdown = res.breakdown || [ { label:'sanctioned Counterparty', delta:40 }, ... ];
 
   scorePanel.setSummary(res);
 
   const feats = res.feats || {};
+  const ageDays   = feats.ageDays != null ? Math.round(feats.ageDays) : '—';
+  const mixerPct  = Math.round((feats.mixerTaint ?? 0) * 100) + '%';
+  const neighPct  = Math.round((feats.local?.riskyNeighborRatio ?? 0) * 100) + '%';
+
   document.getElementById('entityMeta').innerHTML = `
     <div>Address: <b>${res.id}</b></div>
     <div>Network: <b>${res.network}</b></div>
-    <div>Age (days): <b>${feats.ageDays ?? '—'}</b></div>
-    <div>Mixer taint: <b>${Math.round((feats.mixerTaint ?? 0)*100)}%</b></div>
-    <div>Neighbors flagged: <b>${Math.round((feats.local?.riskyNeighborRatio ?? 0)*100)}%</b></div>
-    ${res.block ? `<div class="meta"><b>Policy:</b> Hard Block (listed address)</div>` : ''}
+    <div>Age (days): <b>${ageDays}</b></div>
+    <div>Mixer taint: <b>${mixerPct}</b></div>
+    <div>Neighbors flagged: <b>${neighPct}</b></div>
   `;
 }
 
