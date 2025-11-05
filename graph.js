@@ -1,189 +1,229 @@
-// vision/graph.js  (hardened against bad/empty node data)
+// graph.js — minimal SVG graph renderer for Vision
+// Exposes window.graph: { setData, getData, setHalo, on }
+// CSS hooks used: .vision-graph, .edge, .node-outer, .node-inner,
+//                 g.halo, g.halo.halo-red (your CSS already defines pulses)
 
-const state = {
-  container: null,
-  svg: null,
-  gLinks: null,
-  gNodes: null,
-  data: { nodes: [], links: [] },
-  listeners: new Map(),
-};
+(function(){
+  const state = {
+    nodes: [],
+    links: [],
+    byId: new Map(),
+    listeners: new Map(),
+    selectedId: null
+  };
 
-function on(evt, fn){ if(!state.listeners.has(evt)) state.listeners.set(evt,new Set()); state.listeners.get(evt).add(fn); }
-function off(evt, fn){ const s=state.listeners.get(evt); if(s) s.delete(fn); }
-function emit(evt, payload){ const s=state.listeners.get(evt); if(s) for(const fn of s){ try{ fn(payload); }catch{} } }
-
-function ensureContainer(el){
-  if(el) state.container = el;
-  if(!state.container && typeof document !== 'undefined'){
-    state.container = document.getElementById('graph') ||
-                      document.querySelector('[data-role="graph"]') ||
-                      document.querySelector('.graph');
+  const root = document.getElementById('graph');
+  if (!root) {
+    console.warn('[graph.js] #graph not found; graph module inert.');
+    window.graph = stub();
+    return;
   }
-  return state.container;
-}
 
-function ensureSvg(){
-  const c = ensureContainer(state.container);
-  if(!c) return null;
-  if(!state.svg){
-    const svg = document.createElementNS('http://www.w3.org/2000/svg','svg');
-    svg.setAttribute('class','vision-graph');
-    svg.setAttribute('width','100%'); svg.setAttribute('height','100%');
-    const gLinks = document.createElementNS(svg.namespaceURI,'g'); gLinks.setAttribute('class','links');
-    const gNodes = document.createElementNS(svg.namespaceURI,'g'); gNodes.setAttribute('class','nodes');
-    svg.appendChild(gLinks); svg.appendChild(gNodes);
-    c.innerHTML=''; c.appendChild(svg);
-    state.svg=svg; state.gLinks=gLinks; state.gNodes=gNodes;
+  // Build SVG skeleton
+  root.classList.add('vision-graph');
+  const svg = el('svg', { width:'100%', height:'100%' });
+  const edgesG = el('g', { class:'edges' });
+  const nodesG = el('g', { class:'nodes' });
+  svg.appendChild(edgesG);
+  svg.appendChild(nodesG);
+  root.innerHTML = '';
+  root.appendChild(svg);
+
+  // Resize handling → emit viewportChanged
+  let resizeT = null;
+  new ResizeObserver(() => {
+    clearTimeout(resizeT);
+    resizeT = setTimeout(()=>emit('viewportChanged'), 150);
+    layoutAndRender(); // keep it simple: relayout on resize
+  }).observe(root);
+
+  // API
+  const api = {
+    setData,
+    getData: () => ({ nodes: [...state.nodes], links: [...state.links] }),
+    setHalo,
+    on
+  };
+  window.graph = api;
+
+  /* --------------------- impl ----------------------------------- */
+
+  function on(evt, fn){
+    if (!state.listeners.has(evt)) state.listeners.set(evt, []);
+    state.listeners.get(evt).push(fn);
   }
-  return state.svg;
-}
+  function emit(evt, payload){
+    const arr = state.listeners.get(evt) || [];
+    for (const fn of arr) try { fn(payload); } catch(e){ console.error(e); }
+  }
 
-function getId(n){
-  // Returns a **string id** or null if not present
-  if(!n) return null;
-  const raw = n.id ?? n.address ?? null;
-  return raw != null ? String(raw) : null;
-}
-function nodeKey(id){ return String(id).toLowerCase(); }
+  function setData({nodes, links}){
+    state.nodes = Array.isArray(nodes) ? nodes.map(n => ({...n})) : [];
+    state.links = Array.isArray(links) ? links.map(L => ({...L})) : [];
+    state.byId = new Map(state.nodes.map(n => [n.id, n]));
+    layoutAndRender();
+  }
 
-function circleLayout(nodes){
-  const list = (nodes || []).filter(n => !!getId(n));
-  const pos = new Map();
-  if(list.length === 0 || !state.container) return pos;
+  function layoutAndRender(){
+    // Basic radial layout: choose a center (max degree), ring neighbors around it,
+    // then place remaining nodes on an outer ring.
+    const { width, height } = root.getBoundingClientRect();
+    const cx = width/2, cy = height/2;
+    const R1 = Math.min(width, height) * 0.22;
+    const R2 = Math.min(width, height) * 0.38;
 
-  const rect = state.container.getBoundingClientRect();
-  const cx = rect.width / 2, cy = rect.height / 2;
-  const r = Math.max(60, Math.min(cx, cy) - 40);
+    const deg = degreeMap(state.links);
+    const center = pickCenter(state.nodes, deg);
+    const neighbors = oneHop(center?.id, state.links);
+    const rest = state.nodes.filter(n => n.id !== center?.id && !neighbors.has(n.id));
 
-  // center = first valid node
-  const centerId = getId(list[0]);
-  pos.set(centerId, { x: cx, y: cy });
+    const pos = new Map();
+    if (center) pos.set(center.id, { x: cx, y: cy });
 
-  // ring
-  const ring = list.slice(1);
-  ring.forEach((node, i) => {
-    const id = getId(node); if(!id) return;
-    const a = (2 * Math.PI * i) / (ring.length || 1);
-    pos.set(id, { x: cx + r * Math.cos(a), y: cy + r * Math.sin(a) });
-  });
+    placeRing([...neighbors], R1, cx, cy, pos);
+    placeRing(rest, R2, cx, cy, pos);
 
-  return pos;
-}
-
-export function nodeClassesFor(result, nodeAddress){
-  const addr  = String(nodeAddress || '').toLowerCase();
-  const focus = String(result?.address || '').toLowerCase();
-  const base  = ['node'];
-  const blocked = !!(result?.block || result?.risk_score === 100 || result?.sanctionHits);
-  if (addr && focus && addr === focus){ base.push('halo'); if(blocked) base.push('halo-red'); }
-  const score = typeof result?.risk_score === 'number' ? result.risk_score
-              : (typeof result?.score === 'number' ? result.score : 0);
-  base.push(bandClass(score, blocked));
-  return base.join(' ');
-}
-export function bandClass(score, blocked){
-  if (blocked || score >= 80) return 'band-high';
-  if (score >= 60) return 'band-elevated';
-  return 'band-moderate';
-}
-
-function render(container, data, opts = {}){
-  try{
-    ensureContainer(container);
-    if(!ensureSvg()) return;
-
-    const nodesAll = Array.isArray(data?.nodes) ? data.nodes : [];
-    const linksAll = Array.isArray(data?.links) ? data.links : [];
-
-    // **Filter invalid nodes/links** defensively
-    const nodes = nodesAll.filter(n => !!getId(n));
-    const links = linksAll.filter(l => l && getId({id:l.a}) && getId({id:l.b}));
-
-    const pos = circleLayout(nodes);
-    state.gLinks.innerHTML=''; state.gNodes.innerHTML='';
-
-    if(pos.size === 0) { return; }
-
-    // links
-    for(const l of links){
-      const aId = getId({id:l.a}); const bId = getId({id:l.b});
-      const a = pos.get(aId); const b = pos.get(bId);
-      if(!a || !b) continue;
-      const line = document.createElementNS(state.svg.namespaceURI,'line');
-      line.setAttribute('x1',a.x); line.setAttribute('y1',a.y);
-      line.setAttribute('x2',b.x); line.setAttribute('y2',b.y);
-      line.setAttribute('class','edge');
-      state.gLinks.appendChild(line);
+    // Render edges
+    edgesG.innerHTML = '';
+    for (const L of state.links) {
+      const a = pos.get(L.a) || pos.get(L.source) || pos.get(L.idA) || {x:cx,y:cy};
+      const b = pos.get(L.b) || pos.get(L.target) || pos.get(L.idB) || {x:cx,y:cy};
+      edgesG.appendChild(el('line', {
+        class: 'edge',
+        x1: a.x, y1: a.y, x2: b.x, y2: b.y
+      }));
     }
 
-    // nodes
-    for(const n of nodes){
-      const id = getId(n); const p = pos.get(id);
-      if(!id || !p) continue;
-      const g = document.createElementNS(state.svg.namespaceURI,'g');
-      g.setAttribute('class','node');
-      g.setAttribute('transform',`translate(${p.x},${p.y})`);
-      g.setAttribute('data-address', id);
-      g.setAttribute('data-address-i', nodeKey(id));
-      g.setAttribute('data-id', nodeKey(id));
+    // Render nodes
+    nodesG.innerHTML = '';
+    for (const n of state.nodes) {
+      const p = pos.get(n.id) || { x: cx, y: cy };
+      const g = el('g', { transform: `translate(${p.x},${p.y})` });
+      g.dataset.id = n.id;
 
-      const outer = document.createElementNS(state.svg.namespaceURI,'circle');
-      outer.setAttribute('r','14'); outer.setAttribute('class','node-outer');
-      const inner = document.createElementNS(state.svg.namespaceURI,'circle');
-      inner.setAttribute('r','4'); inner.setAttribute('class','node-inner');
+      const outer = el('circle', { r: 10, class: 'node-outer' });
+      const inner = el('circle', { r: 5,  class: 'node-inner' });
+      g.appendChild(outer);
+      g.appendChild(inner);
 
-      g.appendChild(outer); g.appendChild(inner);
-      g.addEventListener('click', () => emit('selectNode', { id, address:id }));
-      state.gNodes.appendChild(g);
+      // selection styles
+      if (n.id === state.selectedId) {
+        outer.setAttribute('stroke-width', '3');
+      }
+
+      g.addEventListener('click', () => {
+        state.selectedId = n.id;
+        emit('selectNode', { id: n.id, data: n });
+        // lightweight visual feedback
+        refreshSelection(nodesG, n.id);
+      });
+
+      nodesG.appendChild(g);
+    }
+  }
+
+  function setHalo(opts){
+    // Accept either res object or explicit halo opts
+    const id = opts?.id || opts?.address;
+    if (!id) return;
+
+    const g = nodesG.querySelector(`g[data-id="${cssEscape(id)}"]`);
+    if (!g) return;
+    const outer = g.querySelector('.node-outer');
+
+    // Ensure halo class
+    g.classList.add('halo');
+    // Red pulse for blocked
+    if (opts.blocked) g.classList.add('halo-red'); else g.classList.remove('halo-red');
+
+    // Color override
+    if (opts.color) outer.style.stroke = opts.color;
+    else outer.style.stroke = '';
+
+    // Intensity → stroke width hint (cap in CSS anim)
+    if (typeof opts.intensity === 'number') {
+      const sw = 2 + Math.min(14, Math.max(2, Math.round(opts.intensity*10)));
+      outer.style.strokeWidth = String(sw);
+    } else {
+      outer.style.strokeWidth = '';
     }
 
-    emit('render',{ container: state.container, data: {nodes,links}, opts });
-  }catch(err){
-    // Never crash UI due to malformed data; log for debugging.
-    console.warn('graph.render skipped due to error:', err);
+    // Tooltip
+    if (opts.tooltip) g.setAttribute('title', String(opts.tooltip));
   }
-}
 
-function updateStyles(container, result){
-  if (!result?.id && !result?.address) return;
-  setHalo(result);
-  emit('restyle', { container: state.container, result });
-}
+  /* --------------------- helpers -------------------------------- */
 
-function setContainer(el){ ensureContainer(el); ensureSvg(); return state.container; }
-function setData(data){
-  // Always coerce into arrays; guard against nulls
-  const nodes = Array.isArray(data?.nodes) ? data.nodes : [];
-  const links = Array.isArray(data?.links) ? data.links : [];
-  state.data = { nodes, links };
-  render(state.container, state.data);
-  emit('data', state.data);
-}
-function getData(){ return state.data; }
+  function el(tag, attrs) {
+    const e = document.createElementNS('http://www.w3.org/2000/svg', tag);
+    if (attrs) for (const [k,v] of Object.entries(attrs)) {
+      if (v != null) e.setAttribute(k, String(v));
+    }
+    return e;
+  }
 
-function setHalo(target, opts = {}){
-  const isObj = target && typeof target === 'object';
-  const idOrAddr = isObj ? (target.address || target.id) : target;
-  const blocked = isObj ? (!!target.block || target.risk_score === 100 || target.sanctionHits)
-                        : !!opts.blocked;
-  const el = findNodeEl(idOrAddr);
-  if(!el) return false;
-  el.classList.add('halo');
-  if (blocked) el.classList.add('halo-red'); else el.classList.remove('halo-red');
-  return true;
-}
-function clearHalos(){
-  if(!state.gNodes) return;
-  state.gNodes.querySelectorAll('.halo,.halo-red').forEach(n => n.classList.remove('halo','halo-red'));
-}
+  function degreeMap(links){
+    const m = new Map();
+    for (const L of (links||[])) {
+      const a = L.a ?? L.source ?? L.idA;
+      const b = L.b ?? L.target ?? L.idB;
+      if (!a || !b) continue;
+      m.set(a, (m.get(a)||0)+1);
+      m.set(b, (m.get(b)||0)+1);
+    }
+    return m;
+  }
 
-function findNodeEl(address){
-  if(!address || !state.gNodes) return null;
-  const key = nodeKey(address);
-  return state.gNodes.querySelector(`g[data-address-i="${key}"]`);
-}
+  function pickCenter(nodes, deg){
+    if (!nodes?.length) return null;
+    let best = nodes[0], bd = -1;
+    for (const n of nodes) {
+      const d = deg.get(n.id) || 0;
+      if (d > bd) { bd = d; best = n; }
+    }
+    return best;
+  }
 
-const api = { on, off, setData, getData, setContainer, setHalo, clearHalos, render, updateStyles, nodeClassesFor, bandClass };
-export default api;
-try{ if(typeof window!=='undefined') window.graph = api; }catch{}
+  function oneHop(centerId, links){
+    const s = new Set();
+    if (!centerId) return s;
+    for (const L of (links||[])) {
+      const a = L.a ?? L.source ?? L.idA;
+      const b = L.b ?? L.target ?? L.idB;
+      if (a === centerId && b) s.add(b);
+      if (b === centerId && a) s.add(a);
+    }
+    return s;
+    }
+
+  function placeRing(arr, R, cx, cy, pos){
+    const n = arr.length;
+    if (!n) return;
+    for (let i=0;i<n;i++){
+      const id = typeof arr[i] === 'string' ? arr[i] : arr[i].id;
+      const angle = (i / n) * Math.PI * 2 - Math.PI/2;
+      const x = cx + R * Math.cos(angle);
+      const y = cy + R * Math.sin(angle);
+      pos.set(id, { x, y });
+    }
+  }
+
+  function refreshSelection(nodesG, id){
+    nodesG.querySelectorAll('g').forEach(g => {
+      const outer = g.querySelector('.node-outer');
+      if (g.dataset.id === id) outer?.setAttribute('stroke-width','3');
+      else outer?.setAttribute('stroke-width','2');
+    });
+  }
+
+  // CSS.escape polyfill-ish for attribute selectors
+  function cssEscape(s){
+    return String(s).replace(/"/g,'\\"');
+  }
+
+  function stub(){
+    const noop = ()=>{};
+    const obj = { setData:noop, getData:()=>({nodes:[],links:[]}), setHalo:noop, on:noop };
+    return obj;
+  }
+})();
