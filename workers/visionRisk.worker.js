@@ -1,5 +1,6 @@
 // workers/visionRisk.worker.js
-// Scoring + dynamic breakdown + age + NEIGHBORS with real-onchain fallback via /txs.
+// Scoring + dynamic breakdown + age + NEIGHBORS with real-onchain fallback via /txs
+// and computed neighbor statistics returned alongside the graph.
 
 let CFG = {
   apiBase: "",
@@ -43,24 +44,25 @@ self.onmessage = async (e) => {
       const hop = Number(payload?.hop ?? 1) || 1;
       const limit = Number(payload?.limit ?? 250) || 250;
 
-      let data = null;
+      let graph = null;
 
       // 1) Try canonical /neighbors
-      try {
-        data = await fetchNeighbors(addr, network, { hop, limit });
-      } catch {}
+      try { graph = await fetchNeighbors(addr, network, { hop, limit }); } catch {}
 
-      // 2) If missing/empty, derive neighbors from /txs counterparties (real data)
-      if (!data || !Array.isArray(data.nodes) || !data.nodes.length) {
-        data = await deriveNeighborsFromTxs(addr, network, { limit });
+      // 2) Fallback to /txs derived neighbors (real addresses)
+      if (!graph || !Array.isArray(graph.nodes) || !graph.nodes.length) {
+        graph = await deriveNeighborsFromTxs(addr, network, { limit });
       }
 
-      // 3) As a last resort (no API at all), tiny stub so UI path still functions
-      if (!data || !Array.isArray(data.nodes) || !data.nodes.length) {
-        data = stubNeighbors(addr);
+      // 3) Last resort stub so UI stays functional
+      if (!graph || !Array.isArray(graph.nodes) || !graph.nodes.length) {
+        graph = stubNeighbors(addr);
       }
 
-      post({ id, type: 'RESULT', data });
+      // 4) Compute lightweight neighbor stats (sampled) and attach
+      const stats = await computeNeighborStats(addr, network, graph.nodes);
+
+      post({ id, type: 'RESULT', data: { ...graph, stats } });
       return;
     }
 
@@ -80,7 +82,6 @@ async function scoreOne(item) {
   const network = item?.network || CFG.network || 'eth';
   if (!id) throw new Error('scoreOne: missing id');
 
-  // 1) Policy / list check
   let policy = null;
   try {
     if (CFG.apiBase) {
@@ -90,19 +91,14 @@ async function scoreOne(item) {
     }
   } catch (_) {}
 
-  // 2) Local baseline
   let localScore = 55;
   const blocked = !!(policy?.block || policy?.risk_score === 100);
   const mergedScore = blocked ? 100 :
     (typeof policy?.risk_score === 'number' ? policy.risk_score : localScore);
 
-  // 3) Dynamic breakdown
   const breakdown = makeBreakdown(policy);
-
-  // 4) Account age (days)
   const ageDays = await fetchAgeDays(id, network).catch(()=>0);
 
-  // 5) Unified shape
   const reasons = policy?.reasons || policy?.risk_factors || [];
   return {
     type: 'address',
@@ -116,33 +112,22 @@ async function scoreOne(item) {
     reasons,
     risk_factors: reasons,
     breakdown,
-    feats: {
-      ageDays,
-      mixerTaint: 0,
-      local: { riskyNeighborRatio: 0 },
-    },
-    explain: {
-      reasons,
-      blocked,
-      ofacHit: coerceOfacFromPolicy(policy, reasons),
-    },
+    feats: { ageDays, mixerTaint: 0, local: { riskyNeighborRatio: 0 } },
+    explain: { reasons, blocked, ofacHit: coerceOfacFromPolicy(policy, reasons) },
     parity: 'SafeSend parity',
   };
 }
 
-/* ====================== NEIGHBORS ======================== */
+/* ====================== NEIGHBORS (graph) ======================== */
 
 async function fetchNeighbors(address, network, { hop=1, limit=250 } = {}){
   if (!CFG.apiBase) return null;
-
   const url = `${CFG.apiBase}/neighbors?address=${encodeURIComponent(address)}&network=${encodeURIComponent(network)}&hop=${hop}&limit=${limit}`;
   const r = await fetch(url, { headers: { 'accept':'application/json' }, cf:{ cacheTtl: 0 } });
   if (!r.ok) return null;
   const raw = await r.json().catch(()=> ({}));
 
-  const nodes = [];
-  const links = [];
-
+  const nodes = [], links = [];
   const pushNode = (n) => {
     const id = String(n?.id || n?.address || n?.addr || '').toLowerCase();
     if (!id) return;
@@ -177,9 +162,6 @@ async function fetchNeighbors(address, network, { hop=1, limit=250 } = {}){
 /** Fallback: derive 1-hop neighbors from /txs counterparties (real addresses). */
 async function deriveNeighborsFromTxs(address, network, { limit=200 } = {}){
   if (!CFG.apiBase) return null;
-
-  // Pull earliest N (or most recent) — use desc so we get active counterparties
-  // Adjust to your proxy semantics if needed.
   const url = `${CFG.apiBase}/txs?address=${encodeURIComponent(address)}&network=${encodeURIComponent(network)}&limit=${limit}&sort=desc`;
   const r = await fetch(url, { headers:{ 'accept':'application/json' }, cf:{ cacheTtl: 0 } });
   if (!r.ok) return null;
@@ -211,27 +193,91 @@ async function deriveNeighborsFromTxs(address, network, { limit=200 } = {}){
   return { nodes, links };
 }
 
-function pickAddr(tx, side){
-  // Support many shapes: t.from, t.to, t.raw.fromAddress, etc.
-  const s = side === 'from' ? ['from','fromAddress'] : ['to','toAddress'];
-  for (const k of s) {
-    const v = tx?.[k] || tx?.raw?.[k] || tx?.metadata?.[k];
-    if (v) return String(v).toLowerCase();
-  }
-  return null;
-}
+/* ====================== NEIGHBOR STATS ===========================
+   Computes:
+   - neighborsDormant.inactiveRatio  (age > 365d AND lastTx > 180d)
+   - neighborsAvgAge.avgDays         (mean of neighbor ages)
+   - neighborsAvgTxCount.avgTx       (mean of sampled neighbor tx counts)
+   Sampling limits protect APIs.
+=================================================================== */
 
-function stubNeighbors(center){
-  // Last-resort demo so UI plumbing can be verified
-  const centerId = String(center || '').toLowerCase() || '0xseed';
-  const n = 10, nodes = [{ id:centerId, address:centerId, network: CFG.network }];
-  const links = [];
-  for (let i=0;i<n;i++){
-    const id = `0x${Math.random().toString(16).slice(2).padStart(40,'0').slice(0,40)}`;
-    nodes.push({ id, address:id, network: CFG.network });
-    links.push({ a:centerId, b:id, weight:1 });
+async function computeNeighborStats(center, network, nodes){
+  try {
+    // exclude center
+    const neighIds = (nodes || []).map(n => String(n.id || n.address).toLowerCase())
+      .filter(id => id && id !== String(center).toLowerCase());
+
+    if (!neighIds.length) return null;
+
+    const SAMPLE_N = Math.min(40, neighIds.length);     // cap
+    const TX_SAMPLE_LIMIT = 50;                          // per neighbor
+    const now = Date.now();
+    const DAY = 86400000;
+    const pick = neighIds.slice(0, SAMPLE_N);
+
+    // Limit concurrency
+    const chunks = chunk(pick, Math.max(2, Math.min(8, CFG.concurrency || 6)));
+    const results = [];
+    for (const group of chunks) {
+      const batch = group.map(async id => {
+        const ageDays = await fetchAgeDays(id, network).catch(()=>0);
+
+        // recent activity: look at most-recent tx timestamp
+        let lastTxDays = Infinity;
+        try {
+          const url = `${CFG.apiBase}/txs?address=${encodeURIComponent(id)}&network=${encodeURIComponent(network)}&limit=1&sort=desc`;
+          const r = await fetch(url, { headers:{ 'accept':'application/json' }, cf:{ cacheTtl: 0 } });
+          if (r.ok) {
+            const data = await r.json().catch(()=> ({}));
+            const arr = Array.isArray(data?.result) ? data.result : [];
+            if (arr.length) {
+              const t = arr[0];
+              const ts = extractMs(t);
+              if (ts) lastTxDays = (now - ts) / DAY;
+            }
+          }
+        } catch {}
+
+        // coarse tx count proxy (up to TX_SAMPLE_LIMIT)
+        let txCount = 0;
+        try {
+          const url = `${CFG.apiBase}/txs?address=${encodeURIComponent(id)}&network=${encodeURIComponent(network)}&limit=${TX_SAMPLE_LIMIT}&sort=desc`;
+          const r = await fetch(url, { headers:{ 'accept':'application/json' }, cf:{ cacheTtl: 0 } });
+          if (r.ok) {
+            const data = await r.json().catch(()=> ({}));
+            const arr = Array.isArray(data?.result) ? data.result : [];
+            txCount = arr.length; // lower bound / sample count
+          }
+        } catch {}
+
+        return { id, ageDays, lastTxDays, txCount };
+      });
+
+      results.push(...(await Promise.all(batch)));
+    }
+
+    // Aggregate
+    const n = results.length || 1;
+    const avgAge = results.reduce((s,r)=>s+(r.ageDays||0),0)/n;
+    const avgTx  = results.reduce((s,r)=>s+(r.txCount||0),0)/n;
+
+    // Dormant definition: old AND inactive
+    const dormant = results.filter(r => (r.ageDays||0) > 365 && (r.lastTxDays||Infinity) > 180).length;
+    const inactiveRatio = dormant / n;
+    const avgInactiveAge = (() => {
+      const arr = results.filter(r => (r.ageDays||0) > 365 && (r.lastTxDays||Infinity) > 180).map(r=>r.ageDays||0);
+      if (!arr.length) return null;
+      return Math.round(arr.reduce((a,b)=>a+b,0)/arr.length);
+    })();
+
+    return {
+      neighborsDormant: { inactiveRatio, avgInactiveAge, resurrected: 0, whitelistPct: 0, n },
+      neighborsAvgTxCount: { avgTx, n },
+      neighborsAvgAge: { avgDays: avgAge, n }
+    };
+  } catch {
+    return null;
   }
-  return { nodes, links };
 }
 
 /* ====================== HELPERS ======================== */
@@ -266,7 +312,14 @@ async function fetchAgeDays(address, network){
   const arr  = Array.isArray(data?.result) ? data.result : [];
   if (arr.length === 0) return 0;
 
-  const t = arr[0];
+  const ts = extractMs(arr[0]);
+  if (!ts) return 0;
+
+  const days = (Date.now() - ts) / 86400000;
+  return days > 0 ? Math.round(days) : 0;
+}
+
+function extractMs(t){
   const iso = t?.raw?.metadata?.blockTimestamp || t?.metadata?.blockTimestamp;
   const sec = t?.timeStamp || t?.timestamp || t?.blockTime;
   let ms = 0;
@@ -275,13 +328,37 @@ async function fetchAgeDays(address, network){
     const n = Number(sec);
     if (!isNaN(n) && n > 1000000000) ms = (n < 2000000000 ? n*1000 : n);
   }
-  if (!ms) return 0;
-
-  const days = (Date.now() - ms) / 86400000;
-  return days > 0 ? Math.round(days) : 0;
+  return ms || 0;
 }
 
 function coerceOfacFromPolicy(policy, reasons){
   const txt = Array.isArray(reasons) ? reasons.join(' | ').toLowerCase() : String(reasons||'').toLowerCase();
   return !!(policy?.block || policy?.risk_score === 100 || /ofac|sanction/.test(txt));
+}
+
+function pickAddr(tx, side){
+  const s = side === 'from' ? ['from','fromAddress'] : ['to','toAddress'];
+  for (const k of s) {
+    const v = tx?.[k] || tx?.raw?.[k] || tx?.metadata?.[k];
+    if (v) return String(v).toLowerCase();
+  }
+  return null;
+}
+
+function chunk(arr, size){
+  const out = [];
+  for (let i=0;i<arr.length;i+=size) out.push(arr.slice(i, i+size));
+  return out;
+}
+
+function stubNeighbors(center){
+  const centerId = String(center || '').toLowerCase() || '0xseed';
+  const n = 10, nodes = [{ id:centerId, address:centerId, network: CFG.network }];
+  const links = [];
+  for (let i=0;i<n;i++){
+    const id = `0x${Math.random().toString(16).slice(2).padStart(40,'0').slice(0,40)}`;
+    nodes.push({ id, address:id, network: CFG.network });
+    links.push({ a:centerId, b:id, weight:1 });
+  }
+  return { nodes, links };
 }
