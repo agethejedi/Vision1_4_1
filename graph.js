@@ -1,213 +1,210 @@
-// graph.js — minimal SVG renderer with lowercase ID normalization
-// Exposes window.graph: { setData, getData, setHalo, on }
-// Events: 'selectNode', 'viewportChanged'
-// CSS hooks expected: .vision-graph, .edge, .node-outer, .node-inner,
-//                     g.halo, g.halo.halo-red (your CSS defines pulse)
-
+// graph.js — Vision graph renderer (vanilla SVG, radial layout + zoom/pan)
 (function(){
-  const state = {
-    nodes: [],
-    links: [],
-    byId: new Map(),
-    listeners: new Map(),
-    selectedId: null
+  const api = {};
+  const listeners = {};
+  function emit(evt, payload){ (listeners[evt]||[]).forEach(fn => { try{fn(payload);}catch{} }); }
+  api.on = (evt, fn) => { (listeners[evt] ||= []).push(fn); return api; };
+
+  const host = document.getElementById('graph');
+  const svgNS = 'http://www.w3.org/2000/svg';
+  const svg = document.createElementNS(svgNS, 'svg');
+  svg.setAttribute('class', 'vision-graph');
+  svg.setAttribute('width', '100%'); svg.setAttribute('height', '100%');
+  host.appendChild(svg);
+
+  const gRoot  = document.createElementNS(svgNS, 'g'); svg.appendChild(gRoot);
+  const gEdges = document.createElementNS(svgNS, 'g'); gRoot.appendChild(gEdges);
+  const gNodes = document.createElementNS(svgNS, 'g'); gRoot.appendChild(gNodes);
+
+  let data = { nodes:[], links:[] };
+  let nodeIndex = new Map();
+  let halos = new Map();
+  let showLabels = true;
+
+  /* ===== Zoom/Pan ===== */
+  let scale = 1, tx = 0, ty = 0;
+  let dragging = false, lastX=0, lastY=0;
+  function applyTransform(){ gRoot.setAttribute('transform', `translate(${tx},${ty}) scale(${scale})`); }
+  host.addEventListener('wheel', (e)=>{
+    e.preventDefault();
+    const rect = svg.getBoundingClientRect();
+    const cx = (e.clientX - rect.left - tx)/scale;
+    const cy = (e.clientY - rect.top  - ty)/scale;
+    const k  = (e.deltaY < 0 ? 1.1 : 0.9);
+    scale *= k;
+    tx = e.clientX - rect.left - cx*scale;
+    ty = e.clientY - rect.top  - cy*scale;
+    applyTransform();
+  }, { passive:false });
+  host.addEventListener('mousedown', (e)=>{ dragging=true; lastX=e.clientX; lastY=e.clientY; });
+  window.addEventListener('mouseup', ()=> dragging=false);
+  window.addEventListener('mousemove', (e)=>{
+    if (!dragging) return;
+    tx += (e.clientX - lastX);
+    ty += (e.clientY - lastY);
+    lastX = e.clientX; lastY = e.clientY;
+    applyTransform();
+  });
+
+  api.zoomFit = function(){
+    const rect = svg.getBoundingClientRect();
+    const bbox = gRoot.getBBox ? gRoot.getBBox() : { x:0, y:0, width:1, height:1 };
+    if (!bbox.width || !bbox.height) return;
+    const pad = 40;
+    const sx = (rect.width - pad) / bbox.width;
+    const sy = (rect.height - pad) / bbox.height;
+    scale = Math.max(0.1, Math.min(4, Math.min(sx, sy)));
+    tx = (rect.width - bbox.width*scale)/2 - bbox.x*scale;
+    ty = (rect.height - bbox.height*scale)/2 - bbox.y*scale;
+    applyTransform();
   };
+  api.resetView = function(){ scale = 1; tx = ty = 0; applyTransform(); };
 
-  const root = document.getElementById('graph');
-  if (!root) {
-    console.warn('[graph.js] #graph not found; graph module inert.');
-    window.graph = stub();
-    return;
-  }
+  /* ===== Data/Render ===== */
+  api.setData = function(newData){
+    const nodes = Array.isArray(newData?.nodes) ? newData.nodes : [];
+    const links = Array.isArray(newData?.links) ? newData.links : [];
+    data = { nodes, links };
+    nodeIndex = new Map(nodes.map(n => [String(n.id).toLowerCase(), n]));
+    render();
+    emit('dataChanged');
+  };
+  api.getData = () => data;
 
-  root.classList.add('vision-graph');
-  const svg = el('svg', { width:'100%', height:'100%' });
-  const edgesG = el('g', { class:'edges' });
-  const nodesG = el('g', { class:'nodes' });
-  svg.appendChild(edgesG);
-  svg.appendChild(nodesG);
-  root.innerHTML = '';
-  root.appendChild(svg);
+  function render(){
+    // layout: center = first node; others around circle
+    const rect = svg.getBoundingClientRect();
+    const cx = rect.width/2, cy = rect.height/2;
+    const center = data.nodes[0];
+    const N = Math.max(0, data.nodes.length - 1);
+    const R = Math.min(rect.width, rect.height) * 0.28;
 
-  // Resize → layout + viewportChanged
-  let resizeT = null;
-  new ResizeObserver(() => {
-    clearTimeout(resizeT);
-    resizeT = setTimeout(()=>emit('viewportChanged'), 150);
-    layoutAndRender();
-  }).observe(root);
-
-  const api = { setData, getData: () => ({ nodes:[...state.nodes], links:[...state.links] }), setHalo, on };
-  window.graph = api;
-
-  /* ---------------- API ------------------ */
-  function on(evt, fn){
-    if (!state.listeners.has(evt)) state.listeners.set(evt, []);
-    state.listeners.get(evt).push(fn);
-  }
-  function emit(evt, payload){
-    const arr = state.listeners.get(evt) || [];
-    for (const fn of arr) try { fn(payload); } catch(e){ console.error(e); }
-  }
-
-  function setData({nodes, links}){
-    // normalize ids & links to lowercase to avoid checksum/case mismatches
-    const nn = Array.isArray(nodes) ? nodes.map(n => {
-      const id = String(n.id || n.address || '').toLowerCase();
-      return { ...n, id };
-    }) : [];
-
-    const ll = Array.isArray(links) ? links.map(L => {
-      const a = String(L.a ?? L.source ?? L.idA ?? '').toLowerCase();
-      const b = String(L.b ?? L.target ?? L.idB ?? '').toLowerCase();
-      return { a, b, weight: L.weight ?? 1 };
-    }) : [];
-
-    // de-dupe nodes by id
-    const seen = new Set();
-    const dedupNodes = [];
-    for (const n of nn) { if (!seen.has(n.id)) { seen.add(n.id); dedupNodes.push(n); } }
-
-    state.nodes = dedupNodes;
-    state.links = ll.filter(L => L.a && L.b && L.a !== L.b);
-
-    state.byId = new Map(state.nodes.map(n => [n.id, n]));
-
-    layoutAndRender();
-  }
-
-  function layoutAndRender(){
-    const { width, height } = root.getBoundingClientRect();
-    const cx = width/2, cy = height/2;
-    const R1 = Math.min(width, height) * 0.22;
-    const R2 = Math.min(width, height) * 0.38;
-
-    const deg = degreeMap(state.links);
-    const center = pickCenter(state.nodes, deg);
-    const neighbors = oneHop(center?.id, state.links);
-    const rest = state.nodes.filter(n => n.id !== center?.id && !neighbors.has(n.id));
-
+    // node coordinates
     const pos = new Map();
-    if (center) pos.set(center.id, { x: cx, y: cy });
-
-    placeRing([...neighbors], R1, cx, cy, pos);
-    placeRing(rest, R2, cx, cy, pos);
+    if (center) { pos.set(center.id, { x: cx, y: cy }); }
+    for (let i=1; i<data.nodes.length; i++){
+      const n = data.nodes[i];
+      const theta = (i-1) / Math.max(1, N) * Math.PI*2;
+      const x = cx + R * Math.cos(theta);
+      const y = cy + R * Math.sin(theta);
+      pos.set(n.id, { x, y });
+    }
 
     // edges
-    edgesG.innerHTML = '';
-    for (const L of state.links) {
-      const a = pos.get(L.a) || pos.get(L.source) || pos.get(L.idA) || {x:cx,y:cy};
-      const b = pos.get(L.b) || pos.get(L.target) || pos.get(L.idB) || {x:cx,y:cy};
-      edgesG.appendChild(el('line', { class:'edge', x1:a.x, y1:a.y, x2:b.x, y2:b.y }));
+    gEdges.innerHTML = '';
+    for (const L of data.links){
+      const a = pos.get(L.a); const b = pos.get(L.b);
+      if (!a || !b) continue;
+      const line = document.createElementNS(svgNS, 'line');
+      line.setAttribute('x1', a.x); line.setAttribute('y1', a.y);
+      line.setAttribute('x2', b.x); line.setAttribute('y2', b.y);
+      line.setAttribute('class', 'edge');
+      const w = Number(L.weight || 1);
+      line.setAttribute('stroke-width', String( Math.max(1, Math.log2(1+w)+0.5) ));
+      gEdges.appendChild(line);
     }
 
     // nodes
-    nodesG.innerHTML = '';
-    for (const n of state.nodes) {
-      const p = pos.get(n.id) || { x: cx, y: cy };
-      const g = el('g', { transform: `translate(${p.x},${p.y})` });
-      g.dataset.id = n.id;
+    gNodes.innerHTML = '';
+    for (const n of data.nodes){
+      const p = pos.get(n.id) || { x:cx, y:cy };
+      const g = document.createElementNS(svgNS, 'g');
+      g.setAttribute('transform', `translate(${p.x},${p.y})`);
+      g.setAttribute('data-id', n.id);
 
-      const outer = el('circle', { r: 10, class: 'node-outer' });
-      const inner = el('circle', { r: 5,  class: 'node-inner' });
+      const outer = document.createElementNS(svgNS, 'circle');
+      outer.setAttribute('r', 11);
+      outer.setAttribute('class', 'node-outer');
       g.appendChild(outer);
+
+      const inner = document.createElementNS(svgNS, 'circle');
+      inner.setAttribute('r', 5.5);
+      inner.setAttribute('class', 'node-inner');
       g.appendChild(inner);
 
-      if (n.id === state.selectedId) outer.setAttribute('stroke-width', '3');
+      if (showLabels && data.nodes.length <= (window.__SHOW_LABELS_BELOW__||150)) {
+        const text = document.createElementNS(svgNS, 'text');
+        text.setAttribute('y', -16);
+        text.setAttribute('text-anchor', 'middle');
+        text.setAttribute('style', 'fill:#8aa3a0; font-size:10px;');
+        const id = String(n.id);
+        text.textContent = id.slice(0,6)+'…'+id.slice(-4);
+        g.appendChild(text);
+      }
 
-      g.addEventListener('click', () => {
-        state.selectedId = n.id;
-        emit('selectNode', { id: n.id, data: n });
-        refreshSelection(nodesG, n.id);
+      // events
+      g.addEventListener('click', () => emit('selectNode', { id:n.id }));
+      g.addEventListener('mouseenter', (evt) => {
+        const pt = svg.createSVGPoint(); pt.x = p.x; pt.y = p.y;
+        const screen = svg.getBoundingClientRect();
+        emit('hoverNode', { id:n.id, __px: p.x*scale + tx, __py: p.y*scale + ty, screen });
       });
+      g.addEventListener('mouseleave', () => emit('hoverNode', null));
 
-      nodesG.appendChild(g);
+      gNodes.appendChild(g);
     }
+
+    // re-apply halos
+    halos.forEach((v, id) => applyHaloVisual(id, v));
   }
 
-  function setHalo(opts){
-    const id = (opts?.id || opts?.address || '').toLowerCase();
-    if (!id) return;
-
-    const g = nodesG.querySelector(`g[data-id="${cssEscape(id)}"]`);
+  /* ===== Halos ===== */
+  function applyHaloVisual(id, opts){
+    const g = gNodes.querySelector(`g[data-id="${CSS.escape(id)}"]`);
     if (!g) return;
+    // toggle halo/red classes; color via inline stroke on .node-outer
+    g.classList.toggle('halo', true);
+    g.classList.toggle('halo-red', !!opts.blocked);
     const outer = g.querySelector('.node-outer');
+    if (outer && opts.color) outer.style.stroke = opts.color;
+  }
 
-    // Ensure halo class and red pulse for blocked
+  api.setHalo = function(info){
+    if (!info || !info.id) return;
+    halos.set(info.id, info);
+    applyHaloVisual(info.id, info);
+  };
+
+  api.flashHalo = function(id){
+    const g = gNodes.querySelector(`g[data-id="${CSS.escape(id)}"]`);
+    if (!g) return;
     g.classList.add('halo');
-    if (opts.blocked) g.classList.add('halo-red'); else g.classList.remove('halo-red');
+    g.classList.add('halo-flash');
+    setTimeout(()=> g.classList.remove('halo-flash'), 450);
+  };
 
-    // Color override
-    if (opts.color) outer.style.stroke = opts.color;
-    else outer.style.stroke = '';
+  /* ===== Center / Fit ===== */
+  api.centerOn = function(id, { animate=false } = {}){
+    if (!data.nodes.length) return;
+    const idx = data.nodes.findIndex(n => String(n.id).toLowerCase() === String(id).toLowerCase());
+    if (idx <= 0) return; // already center or not found
+    const [node] = data.nodes.splice(idx, 1);
+    data.nodes.unshift(node);
+    if (animate){
+      // small fade to hide jump
+      svg.style.transition = 'opacity .18s ease';
+      svg.style.opacity = '0.4';
+      requestAnimationFrame(()=>{ render(); api.zoomFit(); svg.style.opacity = '1'; setTimeout(()=> svg.style.transition=''; }, 200); });
+    } else { render(); }
+    emit('dataChanged');
+  };
 
-    // Intensity → stroke width hint (bounded)
-    if (typeof opts.intensity === 'number') {
-      const sw = 2 + Math.min(14, Math.max(2, Math.round(opts.intensity*10)));
-      outer.style.strokeWidth = String(sw);
-    } else {
-      outer.style.strokeWidth = '';
-    }
+  api.setLabelVisibility = function(visible){
+    showLabels = !!visible;
+    render();
+  };
 
-    // Tooltip
-    if (opts.tooltip) g.setAttribute('title', String(opts.tooltip));
-  }
+  api.getNodeCenterPx = function(id){
+    const rect = svg.getBoundingClientRect();
+    const node = gNodes.querySelector(`g[data-id="${CSS.escape(id)}"]`);
+    if (!node) return null;
+    const m = node.getCTM();
+    const px = m.e*scale + tx;
+    const py = m.f*scale + ty;
+    return { x:px, y:py, rect };
+  };
 
-  /* -------------- helpers ---------------- */
-  function el(tag, attrs) {
-    const e = document.createElementNS('http://www.w3.org/2000/svg', tag);
-    if (attrs) for (const [k,v] of Object.entries(attrs)) if (v != null) e.setAttribute(k, String(v));
-    return e;
-  }
-  function degreeMap(links){
-    const m = new Map();
-    for (const L of (links||[])) {
-      const a = L.a ?? L.source ?? L.idA;
-      const b = L.b ?? L.target ?? L.idB;
-      if (!a || !b) continue;
-      m.set(a, (m.get(a)||0)+1);
-      m.set(b, (m.get(b)||0)+1);
-    }
-    return m;
-  }
-  function pickCenter(nodes, deg){
-    if (!nodes?.length) return null;
-    let best = nodes[0], bd = -1;
-    for (const n of nodes) {
-      const d = deg.get(n.id) || 0;
-      if (d > bd) { bd = d; best = n; }
-    }
-    return best;
-  }
-  function oneHop(centerId, links){
-    const s = new Set();
-    if (!centerId) return s;
-    for (const L of (links||[])) {
-      const a = L.a ?? L.source ?? L.idA;
-      const b = L.b ?? L.target ?? L.idB;
-      if (a === centerId && b) s.add(b);
-      if (b === centerId && a) s.add(a);
-    }
-    return s;
-  }
-  function placeRing(arr, R, cx, cy, pos){
-    const n = arr.length;
-    if (!n) return;
-    for (let i=0;i<n;i++){
-      const id = typeof arr[i] === 'string' ? arr[i] : arr[i].id;
-      const angle = (i / n) * Math.PI * 2 - Math.PI/2;
-      const x = cx + R * Math.cos(angle);
-      const y = cy + R * Math.sin(angle);
-      pos.set(id, { x, y });
-    }
-  }
-  function refreshSelection(nodesG, id){
-    nodesG.querySelectorAll('g').forEach(g => {
-      const outer = g.querySelector('.node-outer');
-      if (g.dataset.id === id) outer?.setAttribute('stroke-width','3');
-      else outer?.setAttribute('stroke-width','2');
-    });
-  }
-  function cssEscape(s){ return String(s).replace(/"/g,'\\"'); }
-  function stub(){ const noop = ()=>{}; return { setData:noop, getData:()=>({nodes:[],links:[]}), setHalo:noop, on:noop }; }
+  // expose
+  window.graph = api;
+
 })();
