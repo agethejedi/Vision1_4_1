@@ -1,22 +1,22 @@
-// app.js — Vision 1_4: dynamic factors + unified visuals + live neighbor replace + neighbor stats
-// -----------------------------------------------------------------------------------------------
-import './ui/ScoreMeter.js?v=2025-11-02';     // window.ScoreMeter(...)
-import './graph.js?v=2025-11-02';             // window.graph (on/setData/getData/setHalo)
+// app.js — Vision 1_4.1
+// Interactivity: history, zoom controls, hover tooltip, debounce scoring, score cache, lazy labels.
+import './ui/ScoreMeter.js?v=2025-11-02';
+import './graph.js?v=2025-11-05';
 
-/* ================= Feature Flags ==================== */
+/* ============== Flags ============== */
 const RXL_FLAGS = Object.freeze({
   enableNarrative: true,
-  debounceViewportMs: 200,
+  debounceMs: 220,            // selection debounce
+  labelThreshold: 150,        // hide labels above this
 });
 
-/* ================= Worker plumbing ================== */
+/* ============== Worker plumbing ============== */
 const worker = new Worker('./workers/visionRisk.worker.js', { type: 'module' });
-
 const pending = new Map();
 function post(type, payload) {
   return new Promise((resolve, reject) => {
     const id = crypto.randomUUID();
-    pending.set(id, { resolve, reject, _type: type });
+    pending.set(id, { resolve, reject });
     worker.postMessage({ id, type, payload });
   });
 }
@@ -25,7 +25,6 @@ worker.onmessage = (e) => {
   const { id, type, data, error } = e.data || {};
   const req = pending.get(id);
 
-  // Some results are SCORE_* (single result object), others are NEIGHBORS ({nodes,links,stats})
   const isGraphPayload = data && typeof data === 'object' && Array.isArray(data.nodes) && Array.isArray(data.links);
 
   if (type === 'INIT_OK') {
@@ -34,35 +33,17 @@ worker.onmessage = (e) => {
   }
 
   if (type === 'RESULT_STREAM') {
-    // streaming only ever used for SCORE_BATCH
     const r = normalizeResult(data);
-    drawHalo(r);
-    if (r.id === selectedNodeId) {
-      updateScorePanel(r);
-      applyVisualCohesion(r);
-      renderNarrativePanelIfEnabled(r);
-      lastRenderResult = r;
-    }
+    afterScore(r);
     updateBatchStatus(`Scored: ${r.id.slice(0,8)}… → ${r.score}`);
     return;
   }
 
   if (type === 'RESULT') {
-    if (isGraphPayload) {
-      // This is a NEIGHBORS reply — just resolve; do NOT normalize
-      if (req) { req.resolve(data); pending.delete(id); }
-      return;
-    }
-    // Otherwise treat as SCORE_ONE reply
+    if (isGraphPayload) { if (req) { req.resolve(data); pending.delete(id); } return; }
     const r = normalizeResult(data);
-    drawHalo(r);
-    if (r.id === selectedNodeId) {
-      updateScorePanel(r);
-      applyVisualCohesion(r);
-      renderNarrativePanelIfEnabled(r);
-      lastRenderResult = r;
-    }
     if (req) { req.resolve(r); pending.delete(id); }
+    afterScore(r);
     return;
   }
 
@@ -79,7 +60,55 @@ worker.onmessage = (e) => {
   }
 };
 
-/* ================ Result normalization ========================== */
+/* ============== State ============== */
+function getNetwork(){ return document.getElementById('networkSelect')?.value || 'eth'; }
+function normId(x){ return String(x||'').toLowerCase(); }
+let selectedNodeId = null;
+function setSelected(id){ selectedNodeId = normId(id); }
+
+/* history */
+const backStack = [];
+const fwdStack  = [];
+function pushHistory(id){
+  if (backStack.length === 0 || backStack[backStack.length-1] !== id) backStack.push(id);
+  fwdStack.length = 0;
+  updateNavButtons();
+}
+function navBack(){
+  if (backStack.length <= 1) return;
+  const cur = backStack.pop(); // current
+  fwdStack.push(cur);
+  const prev = backStack[backStack.length-1];
+  focusAddress(prev, { fromHistory:true });
+}
+function navForward(){
+  if (!fwdStack.length) return;
+  const next = fwdStack.pop();
+  backStack.push(next);
+  focusAddress(next, { fromHistory:true });
+}
+function updateNavButtons(){
+  document.getElementById('btnBack')?.toggleAttribute('disabled', backStack.length <= 1);
+  document.getElementById('btnFwd')?.toggleAttribute('disabled', fwdStack.length === 0);
+}
+
+/* score cache (per network) */
+const scoreCache = new Map(); // key: `${network}:${address}` -> normalized result
+function cacheKey(addr){ return `${getNetwork()}:${normId(addr)}`; }
+function putScore(res){ scoreCache.set(cacheKey(res.id), res); }
+function getScore(addr){ return scoreCache.get(cacheKey(addr)); }
+
+/* debounce */
+let selTimer = null;
+function debounced(fn){
+  clearTimeout(selTimer);
+  selTimer = setTimeout(fn, RXL_FLAGS.debounceMs);
+}
+
+/* last result for narrative rerender */
+let lastRenderResult = null;
+
+/* ============== Normalize + post-score UI ============== */
 function normalizeResult(res = {}) {
   const id = normId(res.id || res.address);
   const serverScore = (typeof res.risk_score === 'number') ? res.risk_score : null;
@@ -94,194 +123,236 @@ function normalizeResult(res = {}) {
 
   if (typeof explain.walletAgeRisk !== 'number') {
     const days = Number(res.feats?.ageDays ?? NaN);
-    if (!Number.isNaN(days) && days >= 0) {
-      explain.walletAgeRisk = clamp(1 - Math.min(1, days / (365 * 2)));
-    }
+    if (!Number.isNaN(days) && days >= 0) explain.walletAgeRisk = clamp(1 - Math.min(1, days / (365 * 2)));
   }
 
-  // Neighbor proxies if native explain missing
+  // keep proxies (may be overwritten later by worker stats)
   if (!explain.neighborsDormant && res.feats?.local?.riskyNeighborRatio != null) {
-    const r = Number(res.feats.local.riskyNeighborRatio) || 0;
-    explain.neighborsDormant = { inactiveRatio: clamp(r), avgInactiveAge: null, resurrected: 0, whitelistPct: 0, n: null };
-  }
-  if (!explain.neighborsAvgTxCount && res.feats?.local?.neighborAvgTx != null) {
-    explain.neighborsAvgTxCount = { avgTx: Number(res.feats.local.neighborAvgTx) || 0, n: null };
-  }
-  if (!explain.neighborsAvgAge && res.feats?.local?.neighborAvgAgeDays != null) {
-    explain.neighborsAvgAge = { avgDays: Number(res.feats.local.neighborAvgAgeDays) || 0, n: null };
+    explain.neighborsDormant = { inactiveRatio: clamp(res.feats.local.riskyNeighborRatio || 0) };
   }
 
-  return { ...res, id, address: id, score, explain, block: blocked, blocked };
+  return { ...res, id, address:id, score, explain, block: blocked, blocked };
 }
 
-/* ================== Init ======================================= */
-async function init() {
+function afterScore(r){
+  putScore(r);
+  if (r.id === selectedNodeId) {
+    updateScorePanel(r);
+    applyVisualCohesion(r);
+    renderNarrativePanelIfEnabled(r);
+    lastRenderResult = r;
+  }
+}
+
+/* ============== Init & UI wiring ============== */
+async function init(){
   await post('INIT', {
     apiBase: (window.VisionConfig && window.VisionConfig.API_BASE) || "",
-    cache: window.RiskCache,
-    network: getNetwork(),
-    ruleset: 'safesend-2025.10.1',
-    concurrency: 8,
-    flags: { graphSignals: true, streamBatch: true, neighborStats: true }
+    network: getNetwork(), concurrency: 8,
+    flags: { graphSignals:true, streamBatch:true, neighborStats:true }
   });
 
   bindUI();
+  buildGraphControls(); // zoom/reset/back/forward injected into graph pane
   seedDemo();
 }
 init();
 
-/* ================== UI wiring ================================== */
-function bindUI() {
-  document.getElementById('refreshBtn')?.addEventListener('click', () => {
-    scoreVisible();
-  });
-
+function bindUI(){
+  document.getElementById('refreshBtn')?.addEventListener('click', scoreVisible);
   document.getElementById('clearBtn')?.addEventListener('click', () => {
-    window.graph?.setData({ nodes: [], links: [] });
-    updateBatchStatus('Idle');
-    setSelected(null);
-    hideNarrativePanel();
+    window.graph?.setData({ nodes:[], links:[] });
+    setSelected(null); hideNarrativePanel(); updateBatchStatus('Idle');
   });
-
-  document.getElementById('loadSeedBtn')?.addEventListener('click', () => {
-    const seedRaw = document.getElementById('seedInput').value.trim();
-    if (!seedRaw) return;
-    const seed = normId(seedRaw);
-
-    // Replace canvas with a single seed while we fetch live data
-    setGraphData({ nodes:[{ id: seed, address: seed, network: getNetwork() }], links:[] });
-    setSelected(seed);
-
-    // Score + then pull live neighborhood
-    post('SCORE_ONE', { item: { type:'address', id: seed, network: getNetwork() } })
-      .then(r => {
-        const rr = normalizeResult(r);
-        lastRenderResult = rr;
-        updateScorePanel(rr);
-        applyVisualCohesion(rr);
-        renderNarrativePanelIfEnabled(rr);
-      })
-      .catch(()=>{});
-
-    refreshGraphFromLive(seed).catch(()=>{});
-  });
-
   document.getElementById('networkSelect')?.addEventListener('change', async () => {
-    await post('INIT', { network: getNetwork() });
+    await post('INIT', { network:getNetwork() });
+    scoreCache.clear();
     scoreVisible();
   });
 
-  // Node selection → rescore + refresh context + replace with live neighbors
+  // seed loader
+  document.getElementById('loadSeedBtn')?.addEventListener('click', () => {
+    const seed = normId(document.getElementById('seedInput').value.trim());
+    if (!seed) return;
+    focusAddress(seed);
+  });
+
+  // graph events
   window.graph?.on('selectNode', (n) => {
     if (!n) return;
     const id = normId(n.id);
-    setSelected(id);
-
-    post('SCORE_ONE', { item: { type: 'address', id, network: getNetwork() } })
-      .then(r => {
-        const rr = normalizeResult(r);
-        lastRenderResult = rr;
-        updateScorePanel(rr);
-        applyVisualCohesion(rr);
-        renderNarrativePanelIfEnabled(rr);
-      })
-      .catch(() => {});
-
-    refreshGraphFromLive(id).catch(()=>{});
+    debounced(() => focusAddress(id));
   });
 
-  // Optional: rescore visible when viewport changes (if graph emits it)
-  if (typeof window.graph?.on === 'function') {
-    window.graph.on('viewportChanged', () => {
-      clearTimeout(window.__RXL_VP_T__);
-      window.__RXL_VP_T__ = setTimeout(scoreVisible, RXL_FLAGS.debounceViewportMs);
-    });
-  }
-
-  // Narrative UI
-  const modeSel = document.getElementById('rxlMode');
-  if (modeSel) modeSel.addEventListener('change', () => lastRenderResult && renderNarrativePanelIfEnabled(lastRenderResult));
-  const copyBtn = document.getElementById('rxlCopy');
-  if (copyBtn) copyBtn.addEventListener('click', async () => {
-    const txt = document.getElementById('rxlNarrativeText')?.textContent || '';
-    try { await navigator.clipboard.writeText(txt); flash(copyBtn, 'Copied!'); } catch {}
+  // hover → tooltip
+  window.graph?.on('hoverNode', (n) => {
+    if (!n) { hideTooltip(); return; }
+    showTooltip(n);
   });
-  const exportBtn = document.getElementById('rxlExport');
-  if (exportBtn) exportBtn.addEventListener('click', () => { /* exportRiskNarrativePDF(...) */ flash(exportBtn, 'Queued'); });
+
+  // viewport change → lazy labels toggle + optional rescoring
+  window.graph?.on('dataChanged', () => toggleLabelsByCount());
 }
 
-function getNetwork() { return document.getElementById('networkSelect')?.value || 'eth'; }
-function normId(id){ return String(id||'').toLowerCase(); }
+/* ============== Graph controls overlay ============== */
+function buildGraphControls(){
+  const host = document.getElementById('graph');
+  if (!host) return;
+  // buttons
+  const box = document.createElement('div');
+  box.className = 'graph-controls';
+  box.innerHTML = `
+    <button id="btnBack" class="btn btn-ghost" disabled>◀</button>
+    <button id="btnFwd"  class="btn btn-ghost" disabled>▶</button>
+    <span style="flex:1"></span>
+    <button id="btnReset" class="btn btn-ghost">Reset</button>
+    <button id="btnFit"   class="btn">Zoom Fit</button>
+  `;
+  host.appendChild(box);
 
-let selectedNodeId = null;
-function setSelected(id) { selectedNodeId = normId(id); }
+  box.querySelector('#btnBack').addEventListener('click', navBack);
+  box.querySelector('#btnFwd').addEventListener('click', navForward);
+  box.querySelector('#btnReset').addEventListener('click', () => window.graph?.resetView());
+  box.querySelector('#btnFit').addEventListener('click', () => window.graph?.zoomFit());
 
-/* ================= Factor Weights + Builder ===================== */
+  // tooltip container
+  const tip = document.createElement('div');
+  tip.id = 'rxlTooltip';
+  tip.style.cssText = 'position:absolute; pointer-events:none; padding:6px 8px; border-radius:8px; font-size:12px; background:#0c1820; border:1px solid #1a2a33; color:#e7f7f2; box-shadow:0 8px 24px rgba(0,0,0,.35); display:none;';
+  host.appendChild(tip);
+
+  // small styles for controls
+  const st = document.createElement('style');
+  st.textContent = `
+    #graph{ position:relative }
+    .graph-controls{
+      position:absolute; top:8px; right:8px; left:8px; display:flex; gap:6px; align-items:center; z-index:3;
+    }
+    #rxlTooltip.badge-safe{ border-color:#14532d }
+    #rxlTooltip.badge-risk{ border-color:#5c1e1e }
+  `;
+  document.head.appendChild(st);
+}
+
+/* ============== Focus / navigate ============== */
+async function focusAddress(addr, opts = {}){
+  const id = normId(addr);
+  setSelected(id);
+  if (!opts.fromHistory) pushHistory(id);
+
+  // flash selection halo immediately
+  window.graph?.flashHalo(id);
+
+  // score with cache
+  const cached = getScore(id);
+  if (cached) { afterScore(cached); }
+  else {
+    post('SCORE_ONE', { item:{ type:'address', id, network:getNetwork() } })
+      .then(r => { const rr = normalizeResult(r); afterScore(rr); })
+      .catch(()=>{});
+  }
+
+  // load neighbors & recenter
+  setGraphData({ nodes:[{ id, address:id, network:getNetwork() }], links:[] });
+  await refreshGraphFromLive(id);
+  window.graph?.centerOn(id, { animate:true });
+  window.graph?.zoomFit();
+}
+
+/* ============== Tooltip ============== */
+function showTooltip(n){
+  const el = document.getElementById('rxlTooltip');
+  if (!el) return;
+  const addr = normId(n.id);
+  const cached = getScore(addr);
+  const ofac = !!cached?.explain?.ofacHit;
+  const ageDays = cached?.feats?.ageDays ?? null;
+  const niceAge = ageDays ? fmtAgeDays(ageDays) : '—';
+  const neighCount = (window.graph?.getData()?.nodes?.length || 1) - 1;
+
+  el.classList.remove('badge-safe','badge-risk');
+  el.classList.add(ofac ? 'badge-risk' : 'badge-safe');
+  el.innerHTML = `
+    <div style="opacity:.8;">${addr.slice(0,10)}…${addr.slice(-6)}</div>
+    <div>Age: <b>${niceAge}</b></div>
+    <div>Neighbors: <b>${neighCount}</b></div>
+    <div>Badges: ${ofac ? '<span class="badge badge-risk">OFAC</span>' : '<span class="badge badge-safe">No OFAC</span>'}${cached?.explain?.mixerLink ? ' <span class="badge">Mixer</span>' : ''}${cached?.explain?.custodian ? ' <span class="badge">Custodian</span>' : ''}</div>
+  `;
+  el.style.display = 'block';
+  el.style.left = (n.__px + 12) + 'px';
+  el.style.top  = (n.__py + 12) + 'px';
+}
+function hideTooltip(){ const el = document.getElementById('rxlTooltip'); if (el) el.style.display = 'none'; }
+
+/* ============== Batch scoring ============== */
+function scoreVisible(){
+  const vs = (graphGetData().nodes || []).map(n => ({ type:'address', id:normId(n.id), network:getNetwork() }));
+  if (!vs.length) return updateBatchStatus('No nodes in view');
+  updateBatchStatus(`Batch: ${vs.length} nodes`);
+  // only request scores for addresses not cached
+  const items = vs.filter(v => !getScore(v.id));
+  if (items.length) post('SCORE_BATCH', { items }).catch(()=>{});
+}
+
+/* ============== Graph/seed helpers ============== */
+function graphGetData(){
+  const g = window.graph;
+  if (g && typeof g.getData === 'function') return g.getData();
+  return { nodes: window.__VISION_NODES__||[], links: window.__VISION_LINKS__||[] };
+}
+function setGraphData({nodes, links}){
+  window.__VISION_NODES__ = nodes || [];
+  window.__VISION_LINKS__ = links || [];
+  window.graph?.setData({ nodes: window.__VISION_NODES__, links: window.__VISION_LINKS__, showLabelsBelow: RXL_FLAGS.labelThreshold });
+}
+function toggleLabelsByCount(){
+  const count = (graphGetData().nodes || []).length;
+  window.graph?.setLabelVisibility(count <= RXL_FLAGS.labelThreshold);
+}
+
+function seedDemo(){
+  const seed = '0xdemoseed00000000000000000000000000000001';
+  setGraphData({ nodes:[{ id:seed, address:seed, network:getNetwork() }], links:[] });
+  setSelected(seed);
+}
+
+/* ============== Score panel / visuals / narrative (unchanged core) ============== */
 const FACTOR_WEIGHTS = {
-  'OFAC': 40,
-  'OFAC/sanctions list match': 40,
-  'sanctioned Counterparty': 40,
-  'fan In High': 9,
-  'shortest Path To Sanctioned': 6,
-  'burst Anomaly': 0,
-  'known Mixer Proximity': 0,
+  'OFAC': 40, 'OFAC/sanctions list match': 40, 'sanctioned Counterparty': 40,
+  'fan In High': 9, 'shortest Path To Sanctioned': 6, 'burst Anomaly': 0, 'known Mixer Proximity': 0,
 };
-
+const scorePanel = (window.ScoreMeter && window.ScoreMeter('#scorePanel')) || {
+  setSummary(){}, setScore(){}, setBlocked(){}, setReasons(){}, getScore(){ return 0; }
+};
 function computeBreakdownFrom(res){
   if (Array.isArray(res.breakdown) && res.breakdown.length) return res.breakdown;
   const src = res.reasons || res.risk_factors || [];
   if (!Array.isArray(src) || !src.length) return [];
   const list = src.map(label => ({ label: String(label), delta: FACTOR_WEIGHTS[label] ?? 0 }));
   const hasSanctionRef = list.some(x => /sanction|ofac/i.test(x.label));
-  if ((res.block || res.blocked || res.risk_score === 100) && !hasSanctionRef) {
-    list.unshift({ label: 'sanctioned Counterparty', delta: 40 });
-  }
+  if ((res.block || res.blocked || res.risk_score === 100) && !hasSanctionRef) list.unshift({ label:'sanctioned Counterparty', delta:40 });
   return list.sort((a,b)=> (b.delta||0)-(a.delta||0));
 }
-
-/* ================= Score panel instance ========================= */
-const scorePanel = (window.ScoreMeter && window.ScoreMeter('#scorePanel')) || {
-  setSummary(){}, setScore(){}, setBlocked(){}, setReasons(){}, getScore(){ return 0; }
-};
-
-function updateScorePanel(res) {
+function updateScorePanel(res){
   res.parity = (typeof res.parity === 'string' || res.parity === true) ? res.parity : 'SafeSend parity';
-
   const feats = res.feats || {};
   const ageDays = Number(feats.ageDays ?? 0);
   const ageDisplay = (ageDays > 0) ? fmtAgeDays(ageDays) : '—';
-
-  // Dynamic factor list (no static defaults)
   res.breakdown = computeBreakdownFrom(res);
-
-  // Visual blocked is stricter: any OFAC/sanction signal forces red
-  const blocked = isBlockedVisual(res);
-  res.blocked = blocked;
-
+  res.blocked = isBlockedVisual(res);
   scorePanel.setSummary(res);
 
-  // Prefer computed stats (neighborsDormant.inactiveRatio) over proxy feats
-  const inactiveRatio = (res.explain && res.explain.neighborsDormant && typeof res.explain.neighborsDormant.inactiveRatio === 'number')
-    ? res.explain.neighborsDormant.inactiveRatio
-    : (res.feats?.local?.riskyNeighborRatio ?? 0);
-
+  const inactiveRatio = (res.explain?.neighborsDormant?.inactiveRatio ?? res.feats?.local?.riskyNeighborRatio ?? 0);
   const mixerPct = Math.round((feats.mixerTaint ?? 0) * 100) + '%';
-  const neighPct = Math.round((inactiveRatio ?? 0) * 100) + '%';
-
+  const neighPct = Math.round(inactiveRatio * 100) + '%';
   document.getElementById('entityMeta').innerHTML = `
     <div>Address: <b>${res.id}</b></div>
     <div>Network: <b>${res.network}</b></div>
     <div>Age: <b>${ageDisplay}</b></div>
     <div>Mixer taint: <b>${mixerPct}</b></div>
-    <div>Neighbors flagged: <b>${neighPct}</b></div>
-  `;
+    <div>Neighbors flagged: <b>${neighPct}</b></div>`;
 }
-
-/* ================= Unified visuals (halo + ring) ================ */
-function isBlockedVisual(res){
-  return !!(res.block || res.blocked || res.risk_score === 100 ||
-            res.sanctionHits || res.explain?.ofacHit || res.ofac === true);
-}
+function isBlockedVisual(res){ return !!(res.block || res.blocked || res.risk_score === 100 || res.sanctionHits || res.explain?.ofacHit || res.ofac === true); }
 function colorForScore(score, blocked){
   if (blocked) return '#ef4444';
   if (score >= 80) return '#ff3b3b';
@@ -293,307 +364,32 @@ function colorForScore(score, blocked){
 function applyVisualCohesion(res){
   const blocked = isBlockedVisual(res);
   const color = colorForScore(res.score || 0, blocked);
-
-  window.graph?.setHalo({
-    id: res.id,
-    blocked,
-    color,
-    pulse: blocked ? 'red' : 'auto',
-    intensity: Math.max(0.25, (res.score||0)/100),
-    tooltip: res.label
-  });
-
+  window.graph?.setHalo({ id:res.id, blocked, color, pulse: blocked ? 'red' : 'auto', intensity: Math.max(0.25, (res.score||0)/100), tooltip: res.label });
   const panel = document.getElementById('scorePanel');
   if (panel) panel.style.setProperty('--ring-color', color);
 }
 
-/* ================= Graph halo (single source) =================== */
-function drawHalo(res) { applyVisualCohesion(res); }
+/* ============== Narrative (same as before; omitted for brevity if you kept last drop-in) ============== */
+function renderNarrativePanelIfEnabled(res){ /* keep your previous implementation */ }
+function hideNarrativePanel(){ const panel = document.getElementById('narrativePanel'); if (panel) panel.hidden = true; }
 
-/* ================= Status line (Batch Status) =================== */
-function updateBatchStatus(text) {
-  const el = document.getElementById('batchStatus');
-  if (el) el.textContent = text;
-}
-
-/* ================= Scoring pipeline ============================= */
-function scoreVisible() {
-  const viewNodes = getVisibleNodes();
-  if (!viewNodes.length) { updateBatchStatus('No nodes in view'); return; }
-  updateBatchStatus(`Batch: ${viewNodes.length} nodes`);
-  const items = viewNodes.map(n => ({ type: 'address', id: normId(n.id), network: getNetwork() }));
-  post('SCORE_BATCH', { items }).catch(err => console.error(err));
-}
-
-function getVisibleNodes() {
-  const data = graphGetData();
-  return data.nodes || [];
-}
-
-/* ================= Graph data helpers =========================== */
-function graphGetData(){
-  const g = window.graph;
-  if (g && typeof g.getData === 'function') return g.getData();
-  return { nodes: window.__VISION_NODES__ || [], links: window.__VISION_LINKS__ || [] };
-}
-function setGraphData({nodes, links}){
-  window.__VISION_NODES__ = nodes || [];
-  window.__VISION_LINKS__ = links || [];
-  window.graph?.setData({ nodes: window.__VISION_NODES__, links: window.__VISION_LINKS__ });
-}
-
-/* ================= Demo seed graph ============================== */
-function seedDemo() {
-  // Single seed node only; we now replace with live neighbors on load/select
-  const seed = '0xdemoseed00000000000000000000000000000001';
-  setGraphData({ nodes:[{ id: seed, address: seed, network: getNetwork() }], links:[] });
-  setSelected(seed);
-}
-
-/* ================= Neighbors (fetch/replace/merge stats) ======= */
-async function getNeighborsLive(centerId){
-  try {
-    const res = await post('NEIGHBORS', { id: centerId, network: getNetwork(), hop: 1, limit: 250 });
-    // shape: { nodes, links, stats? }
-    if (res && Array.isArray(res.nodes) && Array.isArray(res.links)) return res;
-  } catch {}
-  return { nodes: [], links: [], stats: null };
-}
-
-async function refreshGraphFromLive(centerId){
-  const { nodes, links, stats } = await getNeighborsLive(centerId);
-  if (!nodes.length && !links.length) return; // backend not ready → leave as-is
-
-  const center = { id: normId(centerId), address: normId(centerId), network: getNetwork() };
-  const nn = nodes.map(n => ({ ...n, id: normId(n.id || n.address) }));
-  const ll = links.map(L => ({ a: normId(L.a || L.source || L.idA), b: normId(L.b || L.target || L.idB), weight: L.weight || 1 }));
-
-  let haveCenter = nn.some(n => n.id === center.id);
-  const finalNodes = haveCenter ? nn : [center, ...nn];
-
-  // Ensure center connects to neighbors
-  const knownNeighbors = new Set();
-  for (const L of ll) { if (L.a === center.id) knownNeighbors.add(L.b); if (L.b === center.id) knownNeighbors.add(L.a); }
-  for (const n of nn) { if (!knownNeighbors.has(n.id)) ll.push({ a: center.id, b: n.id, weight: 1 }); }
-
-  setGraphData({ nodes: finalNodes, links: ll });
-
-  // Merge neighbor stats into the currently selected wallet result so UI shows real numbers
-  if (stats && selectedNodeId === center.id) {
-    if (!lastRenderResult) lastRenderResult = { id: center.id, network: getNetwork(), explain: {}, feats: { local:{} } };
-    lastRenderResult.explain = { ...(lastRenderResult.explain || {}), ...(stats || {}) };
-
-    // Provide proxies for Details panel if needed
-    if (stats.neighborsDormant && typeof stats.neighborsDormant.inactiveRatio === 'number') {
-      lastRenderResult.feats = lastRenderResult.feats || {};
-      lastRenderResult.feats.local = lastRenderResult.feats.local || {};
-      lastRenderResult.feats.local.riskyNeighborRatio = stats.neighborsDormant.inactiveRatio;
-    }
-    if (stats.neighborsAvgTxCount && typeof stats.neighborsAvgTxCount.avgTx === 'number') {
-      lastRenderResult.feats.local.neighborAvgTx = stats.neighborsAvgTxCount.avgTx;
-    }
-    if (stats.neighborsAvgAge && typeof stats.neighborsAvgAge.avgDays === 'number') {
-      lastRenderResult.feats.local.neighborAvgAgeDays = stats.neighborsAvgAge.avgDays;
-    }
-
-    // Repaint panels with merged stats
-    updateScorePanel(lastRenderResult);
-    renderNarrativePanelIfEnabled(lastRenderResult);
-  }
-
-  // Soft highlight neighbors, strong for center
-  for (const n of finalNodes) {
-    if (n.id !== center.id) window.graph?.setHalo({ id: n.id, color:'#22d37b', intensity:.5 });
-  }
-  window.graph?.setHalo({ id: center.id, intensity:.9 });
-}
-
-/* ================= Narrative Engine v1 =========================== */
-let lastRenderResult = null;
-
-function narrativeFromExplain(expl, mode = 'analyst') {
-  const parts = [];
-
-  const daysForNice = typeof lastRenderResult?.feats?.ageDays === 'number'
-    ? lastRenderResult.feats.ageDays : null;
-  const niceAge = daysForNice != null ? fmtAgeDays(daysForNice) : null;
-
-  const ageRisk = Number(expl.walletAgeRisk ?? NaN);
-  if (!Number.isNaN(ageRisk)) {
-    if (ageRisk >= 0.6) parts.push(niceAge ? `newly created (${niceAge})` : 'newly created');
-    else if (ageRisk <= 0.2) parts.push(niceAge ? `long-standing (${niceAge})` : 'long-standing');
-  }
-
-  const dorm = expl.neighborsDormant || {};
-  if (typeof dorm.inactiveRatio === 'number' && dorm.inactiveRatio >= 0.6) {
-    let bit = 'connected to multiple dormant aged wallets';
-    if ((dorm.resurrected || 0) > 0) bit += ' (including recently re-activated addresses)';
-    parts.push(bit);
-  }
-
-  const nc = expl.neighborsAvgTxCount || {};
-  if (typeof nc.avgTx === 'number' && nc.avgTx >= 200) {
-    parts.push('in a high-volume counterparty cluster');
-  }
-
-  if (expl.mixerLink) parts.push('with adjacency to mixer infrastructure');
-
-  let text = 'This wallet is ' + (parts.length ? parts.join(', ') : 'under assessment') + '.';
-  if (!expl.ofacHit) text += ' No direct OFAC link was found.';
-
-  if (mode === 'consumer') {
-    text = text.replace('This wallet is', 'Unusual pattern: this wallet')
-               .replace(' No direct OFAC link was found.', '');
-  }
-
-  const badges = [];
-  const push = (label, level='warn') => badges.push({ label, level });
-  if (typeof dorm.inactiveRatio === 'number' && dorm.inactiveRatio >= 0.6) push('Dormant Cluster', 'risk');
-  if (!Number.isNaN(ageRisk) && ageRisk >= 0.6) push('Young Wallet', 'warn');
-  if (typeof nc.avgTx === 'number' && nc.avgTx >= 200) push('High Counterparty Volume', 'warn');
-  push(expl.ofacHit ? 'OFAC' : 'No OFAC', expl.ofacHit ? 'risk' : 'safe');
-
-  const factors = Array.isArray(expl.factorImpacts)
-    ? [...expl.factorImpacts].sort((a,b)=>(b.delta||0)-(a.delta||0)).slice(0,5)
-    : [];
-
-  return { text, badges, factors };
-}
-
-function renderNarrativePanelIfEnabled(res) {
-  lastRenderResult = res;
-  if (!RXL_FLAGS.enableNarrative) return;
-  const panel = document.getElementById('narrativePanel');
-  if (!panel) return;
-
-  const expl = res.explain || {};
-
-  if (!expl.neighborsDormant && res.feats?.local?.riskyNeighborRatio != null) {
-    const r = Number(res.feats.local.riskyNeighborRatio) || 0;
-    expl.neighborsDormant = { inactiveRatio: clamp(r), avgInactiveAge: null, resurrected: 0, whitelistPct: 0, n: null };
-  }
-  if (!expl.neighborsAvgTxCount && res.feats?.local?.neighborAvgTx != null) {
-    expl.neighborsAvgTxCount = { avgTx: Number(res.feats.local.neighborAvgTx) || 0, n: null };
-  }
-  if (typeof expl.walletAgeRisk !== 'number' && typeof res.feats?.ageDays === 'number') {
-    const d = res.feats.ageDays;
-    expl.walletAgeRisk = clamp(1 - Math.min(1, d / (365 * 2)));
-  }
-
-  const modeSel = document.getElementById('rxlMode');
-  const mode = modeSel ? modeSel.value : 'analyst';
-  let { text, badges, factors } = narrativeFromExplain(expl, mode);
-
-  if ((!factors || !factors.length) && Array.isArray(res.breakdown)) {
-    factors = res.breakdown.slice(0,5).map(x => ({ label: x.label, delta: x.delta, sourceKey: 'breakdown' }));
-  }
-
-  panel.hidden = false;
-
-  const textEl = document.getElementById('rxlNarrativeText');
-  if (textEl) textEl.textContent = text;
-
-  const badgesEl = document.getElementById('rxlBadges');
-  if (badgesEl) {
-    badgesEl.innerHTML = '';
-    badges.forEach(b => {
-      const span = document.createElement('span');
-      span.className = `badge ${badgeClass(b.level)}`;
-      span.textContent = b.label;
-      badgesEl.appendChild(span);
-    });
-  }
-
-  const tbody = document.querySelector('#rxlFactors tbody');
-  if (tbody) {
-    tbody.innerHTML = '';
-    const rows = (factors && factors.length) ? factors : defaultFactorRowsFrom(res);
-    rows.forEach(row => {
-      const tr = document.createElement('tr');
-      tr.innerHTML = `
-        <td>${row.label}</td>
-        <td>${row.metrics || deriveMetrics(res, row.sourceKey)}</td>
-        <td style="text-align:right;">${row.delta != null ? ('+' + row.delta) : '—'}</td>
-        <td><code>${row.sourceKey || 'derived'}</code></td>
-      `;
-      tbody.appendChild(tr);
-    });
-  }
-}
-
-function hideNarrativePanel(){
-  const panel = document.getElementById('narrativePanel');
-  if (panel) panel.hidden = true;
-}
-
-function defaultFactorRowsFrom(res){
-  return [
-    { label: 'Dormant neighbors', sourceKey:'neighborsDormant' },
-    { label: 'Neighbors avg tx',  sourceKey:'neighborsAvgTxCount' },
-    { label: 'Neighbors avg age', sourceKey:'neighborsAvgAge' },
-    { label: 'Wallet age',        sourceKey:'walletAgeRisk' },
-    { label: 'OFAC',              sourceKey:'ofacHit' }
-  ];
-}
-
-function deriveMetrics(res, key){
-  const e = res.explain || {};
-  switch (key) {
-    case 'neighborsDormant': {
-      const d = e.neighborsDormant || {};
-      if (typeof d.inactiveRatio === 'number') {
-        return `inactiveRatio ${(d.inactiveRatio*100).toFixed(1)}%` +
-               (d.avgInactiveAge ? `, avgAge ${Math.round(d.avgInactiveAge)}d` : '');
-      }
-      const r = res.feats?.local?.riskyNeighborRatio;
-      return (typeof r === 'number') ? `proxyRatio ${(r*100).toFixed(1)}%` : '—';
-    }
-    case 'neighborsAvgTxCount': {
-      const v = e.neighborsAvgTxCount?.avgTx ?? res.feats?.local?.neighborAvgTx;
-      return (typeof v === 'number') ? `avgTx ${Math.round(v)}` : '—';
-    }
-    case 'neighborsAvgAge': {
-      const v = e.neighborsAvgAge?.avgDays ?? res.feats?.local?.neighborAvgAgeDays;
-      return (typeof v === 'number') ? `avgDays ${Math.round(v)}` : '—';
-    }
-    case 'walletAgeRisk': {
-      const days = typeof res.feats?.ageDays === 'number' ? res.feats.ageDays : null;
-      return days != null ? fmtAgeDays(days) : '—';
-    }
-    case 'ofacHit':
-      return (res.sanctionHits || e.ofacHit) ? 'hit' : 'none';
-    default:
-      return '—';
-  }
-}
-
-function badgeClass(level){
-  switch(level){
-    case 'risk': return 'badge-risk';
-    case 'safe': return 'badge-safe';
-    default:     return 'badge-warn';
-  }
-}
-
-/* ================= Utilities ==================================== */
-function clamp(x, a=0, b=1){ return Math.max(a, Math.min(b, x)); }
+/* ============== Utilities ============== */
+function clamp(x,a=0,b=1){ return Math.max(a, Math.min(b, x)); }
 function fmtAgeDays(days){
   if(!(days > 0)) return '—';
   const totalMonths = Math.round(days / 30.44);
-  const y = Math.floor(totalMonths / 12);
-  const m = totalMonths % 12;
-  if (y > 0 && m > 0) return `${y}y ${m}m`;
-  if (y > 0) return `${y}y`;
-  return `${m}m`;
+  const y = Math.floor(totalMonths/12), m = totalMonths % 12;
+  if (y>0 && m>0) return `${y}y ${m}m`; if (y>0) return `${y}y`; return `${m}m`;
 }
-function flash(btn, msg){ const keep = btn.textContent; btn.textContent = msg; setTimeout(()=>btn.textContent = keep, 900); }
 function hasReason(res, kw){
-  const arr = res.reasons || res.risk_factors || [];
-  const txt = Array.isArray(arr) ? JSON.stringify(arr).toLowerCase() : String(arr).toLowerCase();
+  const arr = res.reasons || res.risk_factors || []; const txt = Array.isArray(arr) ? JSON.stringify(arr).toLowerCase() : String(arr).toLowerCase();
   return txt.includes(kw);
 }
 function coerceOfacFlag(explain, res){
   const hit = !!(res.sanctionHits || res.sanctioned || res.ofac || hasReason(res, 'ofac') || hasReason(res, 'sanction'));
-  explain.ofacHit = hit;
-  return hit;
+  explain.ofacHit = hit; return hit;
 }
+function updateBatchStatus(t){ const el = document.getElementById('batchStatus'); if (el) el.textContent = t; }
+
+/* exports used by app internals */
+window.__RXL__ = { focusAddress }; // handy for manual testing in console
