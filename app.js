@@ -177,12 +177,24 @@ function bindUI(){
     focusAddress(seed);
   });
 
-  // graph events
-  window.graph?.on('selectNode', (n) => {
+  // graph events (defensive binding)
+const g = window.graph;
+if (g && typeof g.on === 'function') {
+  g.on('selectNode', (n) => {
     if (!n) return;
     const id = normId(n.id);
     debounced(() => focusAddress(id));
   });
+
+  // hover → tooltip (only if graph emits it)
+  g.on('hoverNode', (n) => {
+    if (!n) { hideTooltip(); return; }
+    showTooltip(n);
+  });
+
+  // viewport/data change → lazy labels toggle
+  g.on('dataChanged', () => toggleLabelsByCount());
+}
 
   // hover → tooltip
   window.graph?.on('hoverNode', (n) => {
