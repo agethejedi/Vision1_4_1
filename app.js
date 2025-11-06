@@ -1,5 +1,5 @@
-// app.js — Vision 1_4: dynamic factors + unified visuals + live neighbor replace
-// -------------------------------------------------------------------------------
+// app.js — Vision 1_4: dynamic factors + unified visuals + live neighbor replace + neighbor stats
+// -----------------------------------------------------------------------------------------------
 import './ui/ScoreMeter.js?v=2025-11-02';     // window.ScoreMeter(...)
 import './graph.js?v=2025-11-02';             // window.graph (on/setData/getData/setHalo)
 
@@ -16,7 +16,7 @@ const pending = new Map();
 function post(type, payload) {
   return new Promise((resolve, reject) => {
     const id = crypto.randomUUID();
-    pending.set(id, { resolve, reject });
+    pending.set(id, { resolve, reject, _type: type });
     worker.postMessage({ id, type, payload });
   });
 }
@@ -25,30 +25,42 @@ worker.onmessage = (e) => {
   const { id, type, data, error } = e.data || {};
   const req = pending.get(id);
 
+  // Some results are SCORE_* (single result object), others are NEIGHBORS ({nodes,links,stats})
+  const isGraphPayload = data && typeof data === 'object' && Array.isArray(data.nodes) && Array.isArray(data.links);
+
   if (type === 'INIT_OK') {
     if (req) { req.resolve(true); pending.delete(id); }
     return;
   }
 
   if (type === 'RESULT_STREAM') {
+    // streaming only ever used for SCORE_BATCH
     const r = normalizeResult(data);
     drawHalo(r);
     if (r.id === selectedNodeId) {
       updateScorePanel(r);
       applyVisualCohesion(r);
       renderNarrativePanelIfEnabled(r);
+      lastRenderResult = r;
     }
     updateBatchStatus(`Scored: ${r.id.slice(0,8)}… → ${r.score}`);
     return;
   }
 
   if (type === 'RESULT') {
+    if (isGraphPayload) {
+      // This is a NEIGHBORS reply — just resolve; do NOT normalize
+      if (req) { req.resolve(data); pending.delete(id); }
+      return;
+    }
+    // Otherwise treat as SCORE_ONE reply
     const r = normalizeResult(data);
     drawHalo(r);
     if (r.id === selectedNodeId) {
       updateScorePanel(r);
       applyVisualCohesion(r);
       renderNarrativePanelIfEnabled(r);
+      lastRenderResult = r;
     }
     if (req) { req.resolve(r); pending.delete(id); }
     return;
@@ -69,22 +81,17 @@ worker.onmessage = (e) => {
 
 /* ================ Result normalization ========================== */
 function normalizeResult(res = {}) {
-  // normalize id to lowercase so it matches graph ids
   const id = normId(res.id || res.address);
-
   const serverScore = (typeof res.risk_score === 'number') ? res.risk_score : null;
   const score = (serverScore != null) ? serverScore : (typeof res.score === 'number' ? res.score : 0);
-
   const blocked = !!(res.block || serverScore === 100 || res.sanctionHits);
 
   const explain = res.explain && typeof res.explain === 'object'
     ? { ...res.explain }
     : { reasons: res.reasons || res.risk_factors || [] };
 
-  // OFAC boolean for visuals + badges
   coerceOfacFlag(explain, res);
 
-  // Wallet-age risk fallback (younger → higher risk)
   if (typeof explain.walletAgeRisk !== 'number') {
     const days = Number(res.feats?.ageDays ?? NaN);
     if (!Number.isNaN(days) && days >= 0) {
@@ -149,6 +156,7 @@ function bindUI() {
     post('SCORE_ONE', { item: { type:'address', id: seed, network: getNetwork() } })
       .then(r => {
         const rr = normalizeResult(r);
+        lastRenderResult = rr;
         updateScorePanel(rr);
         applyVisualCohesion(rr);
         renderNarrativePanelIfEnabled(rr);
@@ -172,6 +180,7 @@ function bindUI() {
     post('SCORE_ONE', { item: { type: 'address', id, network: getNetwork() } })
       .then(r => {
         const rr = normalizeResult(r);
+        lastRenderResult = rr;
         updateScorePanel(rr);
         applyVisualCohesion(rr);
         renderNarrativePanelIfEnabled(rr);
@@ -251,8 +260,13 @@ function updateScorePanel(res) {
 
   scorePanel.setSummary(res);
 
+  // Prefer computed stats (neighborsDormant.inactiveRatio) over proxy feats
+  const inactiveRatio = (res.explain && res.explain.neighborsDormant && typeof res.explain.neighborsDormant.inactiveRatio === 'number')
+    ? res.explain.neighborsDormant.inactiveRatio
+    : (res.feats?.local?.riskyNeighborRatio ?? 0);
+
   const mixerPct = Math.round((feats.mixerTaint ?? 0) * 100) + '%';
-  const neighPct = Math.round((feats.local?.riskyNeighborRatio ?? 0) * 100) + '%';
+  const neighPct = Math.round((inactiveRatio ?? 0) * 100) + '%';
 
   document.getElementById('entityMeta').innerHTML = `
     <div>Address: <b>${res.id}</b></div>
@@ -336,17 +350,18 @@ function seedDemo() {
   setSelected(seed);
 }
 
-/* ================= Neighbors (fetch/replace/highlight) ========= */
+/* ================= Neighbors (fetch/replace/merge stats) ======= */
 async function getNeighborsLive(centerId){
   try {
     const res = await post('NEIGHBORS', { id: centerId, network: getNetwork(), hop: 1, limit: 250 });
+    // shape: { nodes, links, stats? }
     if (res && Array.isArray(res.nodes) && Array.isArray(res.links)) return res;
   } catch {}
-  return { nodes: [], links: [] };
+  return { nodes: [], links: [], stats: null };
 }
 
 async function refreshGraphFromLive(centerId){
-  const { nodes, links } = await getNeighborsLive(centerId);
+  const { nodes, links, stats } = await getNeighborsLive(centerId);
   if (!nodes.length && !links.length) return; // backend not ready → leave as-is
 
   const center = { id: normId(centerId), address: normId(centerId), network: getNetwork() };
@@ -356,17 +371,35 @@ async function refreshGraphFromLive(centerId){
   let haveCenter = nn.some(n => n.id === center.id);
   const finalNodes = haveCenter ? nn : [center, ...nn];
 
-  // Ensure center connects to neighbors (defensive in case API omits some links)
+  // Ensure center connects to neighbors
   const knownNeighbors = new Set();
-  for (const L of ll) {
-    if (L.a === center.id) knownNeighbors.add(L.b);
-    if (L.b === center.id) knownNeighbors.add(L.a);
-  }
-  for (const n of nn) {
-    if (!knownNeighbors.has(n.id)) ll.push({ a: center.id, b: n.id, weight: 1 });
-  }
+  for (const L of ll) { if (L.a === center.id) knownNeighbors.add(L.b); if (L.b === center.id) knownNeighbors.add(L.a); }
+  for (const n of nn) { if (!knownNeighbors.has(n.id)) ll.push({ a: center.id, b: n.id, weight: 1 }); }
 
   setGraphData({ nodes: finalNodes, links: ll });
+
+  // Merge neighbor stats into the currently selected wallet result so UI shows real numbers
+  if (stats && selectedNodeId === center.id) {
+    if (!lastRenderResult) lastRenderResult = { id: center.id, network: getNetwork(), explain: {}, feats: { local:{} } };
+    lastRenderResult.explain = { ...(lastRenderResult.explain || {}), ...(stats || {}) };
+
+    // Provide proxies for Details panel if needed
+    if (stats.neighborsDormant && typeof stats.neighborsDormant.inactiveRatio === 'number') {
+      lastRenderResult.feats = lastRenderResult.feats || {};
+      lastRenderResult.feats.local = lastRenderResult.feats.local || {};
+      lastRenderResult.feats.local.riskyNeighborRatio = stats.neighborsDormant.inactiveRatio;
+    }
+    if (stats.neighborsAvgTxCount && typeof stats.neighborsAvgTxCount.avgTx === 'number') {
+      lastRenderResult.feats.local.neighborAvgTx = stats.neighborsAvgTxCount.avgTx;
+    }
+    if (stats.neighborsAvgAge && typeof stats.neighborsAvgAge.avgDays === 'number') {
+      lastRenderResult.feats.local.neighborAvgAgeDays = stats.neighborsAvgAge.avgDays;
+    }
+
+    // Repaint panels with merged stats
+    updateScorePanel(lastRenderResult);
+    renderNarrativePanelIfEnabled(lastRenderResult);
+  }
 
   // Soft highlight neighbors, strong for center
   for (const n of finalNodes) {
